@@ -1,53 +1,36 @@
 # Roadmap
 
-## Stage 1: built
+## Built
 
-- colour segmentation, homography and floor map
-- the four signals
-- baseline by age and hour of day
-- alert engine
-- web panel
-- tests on synthetic video
+- Colour segmentation (stage 1), homography and floor map
+- Per-bird detection modes: inline YOLO, MVBroTrack per-frame output, generic JSONL
+- Floor-plane tracker and per-bird metrics (`signals/tracks.py`)
+- The four signals in both modes, baseline by age and hour of day, lighting-aware rhythm
+- Alert engine, web panel, vet log and daily mortality log
+- Fine-tuning workflow: frame sampling, pre-labelling, day-wise split, training,
+  per-phase evaluation ([`finetune.md`](finetune.md))
+- Validation of alerts against the vet log (`pews validate`)
+- Tests on synthetic video
 
-**Next steps on real data:**
+## Next steps on real data (in this order)
 
-1. Real house dimensions and calibration of all three cameras. Current values are estimates.
-2. Process all clips from the November and December 2025 flock so the baseline exists.
-3. Review that flock's alerts with the vet: which were right and which were wrong? Tune `rules.yaml` from that review.
-4. Enter that flock's daily mortality from the farm records with `pews log-mortality`.
+1. **Calibration.** Measure the house and calibrate all three cameras. Current values are estimates.
+2. **Reference data from today on.** Vet log in the panel (clinical signs,
+   diagnoses, deaths, treatments), daily mortality, lighting programme in
+   `farm.yaml`, and a temperature/humidity sensor (`POST /api/environment`).
+3. **Fine-tune the detector** ([`finetune.md`](finetune.md)) and switch
+   `segmenter.kind` to `yolo`.
+4. **Replay a full flock** (`pews process`) to build the baseline, then
+   `pews validate` against the vet log. Tune `rules.yaml` from the report.
 
-## Stage 2: individual bird detection
+## Later
 
-- Train YOLO-seg following [`labeling_guide.md`](labeling_guide.md)
-- Individual detection enables:
-  - bird counting
-  - mortality detection in huddles
-  - (if the class is trained) lethargic birds
-
-## Stage 3: multi-view tracking (MVBroTrack)
-
-The MVBroTrack code (Cardoen et al., Computers and Electronics in Agriculture, 2025) is at the root of this repository. It tracks birds from several overhead cameras on a shared ground plane. It runs in its own environment (`README_MVBroTrack.md`).
-
-**Integration with the early-warning system:**
-
-1. Run its single-view detector (`sv_main.py`, YOLO) on the farm's videos. Fine-tune it with labelled frames from this farm ([`labeling_guide.md`](labeling_guide.md)).
-2. Save the detections of each clip next to the clip in this format:
-   ```
-   05.45.00-05.50.00RO000.h264.dets.jsonl
-   {"frame": 0, "boxes": [[x1, y1, x2, y2], ...]}     # full-resolution pixels
-   ```
-3. Set `segmenter.kind: external` in `farm.yaml`.
-
-Tracking individual birds adds:
-- net displacement of each bird (the activity measure in Soster et al.)
-- gait distribution
-- direct detection of a bird that does not leave one spot
-
-Two pieces are still missing for this:
-- a script that converts the output of `sv_main.py` or `mvt_main.py` to `.dets.jsonl`
-- a `signals/tracks.py` module for per-bird trajectory metrics
-
-The exact output format of that code must be checked on a real run.
+- Multi-camera fusion of tracks on the shared ground plane, using the
+  MVBroTrack ground-plane code (`ground_plane_detection/`, `ground_plane_tracking/`)
+  instead of the simple per-camera tracker, if the cameras overlap.
+- A `dead` class trained from the birds confirmed in the panel.
+- A small converter from `mvt_main.py` tracks to per-bird metrics, once its
+  output on this farm's clips has been inspected.
 
 ## Out of reach for these cameras (project document)
 
@@ -55,4 +38,6 @@ The exact output format of that code must be checked on a real run.
 - comb colour
 - open-mouth breathing and panting
 
-These need close-up cameras or sound. A low-cost option is **audio**: detecting sneezes and respiratory sounds with a microphone, as studied in PoultryFI (arXiv 2510.15757) and by Carpentier et al.
+These need close-up cameras or sound. A low-cost option is **audio**: detecting
+sneezes and respiratory sounds with a microphone, as studied in PoultryFI
+(arXiv 2510.15757) and by Carpentier et al.

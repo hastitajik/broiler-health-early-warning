@@ -3,7 +3,8 @@ opencv-python-headless>=4.8
 PyYAML>=6.0
 fastapi>=0.110
 uvicorn>=0.27
-# optional, for a trained detector (stage 2):
+scipy>=1.10
+# for the detector (stage 2, fine-tuning and inline detection):
 # ultralytics>=8.3
 # dev:
 # pytest>=8

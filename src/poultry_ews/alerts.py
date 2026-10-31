@@ -35,6 +35,10 @@ MESSAGES = {
     "rhythm_loss": "The flock's daily activity pattern does not match previous days.",
     "rhythm_flattening": "The day/night activity difference has shrunk (the rhythm is flattening).",
     "mortality_candidate": "A bird has stayed in one place without moving for a long time. It may be dead.",
+    "inactivity_rise": "More birds than normal for this age and hour are inactive.",
+    "active_speed_drop": "Birds that do move are walking slower than normal for this age and hour.",
+    "feeder_time_drop": "Birds are spending less time at the feeders than normal for this age and hour.",
+    "periphery_count_rise": "More birds than usual are counted at the walls and corners.",
 }
 
 ACTIONS = {
@@ -178,10 +182,13 @@ class AlertEngine:
     def raise_mortality_candidate(self, pen: str, slot: datetime, cand: dict, snapshots: list[str]) -> int:
         details = {"candidate_id": cand["id"], "x_m": cand["x_m"], "y_m": cand["y_m"],
                    "still_min": cand["still_min"], "first_seen": cand["first_slot"],
+                   "dead_votes": cand.get("dead_votes") or 0,
                    "actions": ACTIONS["mortality"], "signal_title": SIGNAL_TITLES["mortality"]}
         msg = (MESSAGES["mortality_candidate"] +
                f" Approximate location: {cand['x_m']:.1f} m from the left wall, {cand['y_m']:.1f} m from the"
                f" far end. Still for about {cand['still_min']:.0f} minutes.")
+        if cand.get("dead_votes"):
+            msg += f" The detector classified this bird as dead in {cand['dead_votes']} clip(s)."
         eid = self.store.create_event(
             pen=pen, rule_id="mortality_candidate", signal="mortality", severity="critical",
             opened_ts=iso(slot), updated_ts=iso(slot), slot_ts=iso(slot), value=cand["still_min"],

@@ -24,15 +24,17 @@ from pydantic import BaseModel
 from ..alerts import ACTIONS, SIGNAL_TITLES, signal_states
 from ..config import Config
 from ..pipeline import Pipeline
-from ..store import iso, parse_iso
+from ..store import OBSERVATION_KINDS, iso, parse_iso
+from ..validation import validate
 
 STATIC = Path(__file__).parent / "static"
 
 SIGNAL_METRICS = {
-    "activity": ["activity_index", "mean_speed"],
+    "activity": ["activity_index", "mean_speed", "inactive_frac", "active_speed"],
     "distribution": ["resource_frac", "periphery_frac", "frac_feeder", "frac_drinker",
-                     "frac_wall", "frac_corner", "dispersion_entropy", "bird_coverage"],
-    "mortality": ["still_candidates", "daily_mortality_pct"],
+                     "frac_wall", "frac_corner", "dispersion_entropy", "bird_coverage",
+                     "resource_count_frac", "periphery_count_frac", "feeder_time_frac"],
+    "mortality": ["still_candidates", "daily_mortality_pct", "bird_count"],
     "circadian": ["rhythm_corr", "rhythm_amplitude"],
 }
 
@@ -55,6 +57,15 @@ class DailyLogIn(BaseModel):
     deaths: int
     culls: int = 0
     note: str = ""
+
+
+class ObservationIn(BaseModel):
+    pen: str
+    kind: str             # see store.OBSERVATION_KINDS
+    ts: str | None = None
+    severity: str = ""
+    note: str = ""
+    by: str = ""
 
 
 class EnvIn(BaseModel):
@@ -228,6 +239,32 @@ def create_app(cfg: Config, pipe: Pipeline | None = None) -> FastAPI:
     def get_daily_log(pen: str):
         pen_or_404(pen)
         return [dict(r) for r in st.q("SELECT * FROM daily_log WHERE pen=? ORDER BY date DESC", (pen,))]
+
+    @app.get("/api/observation-kinds")
+    def observation_kinds():
+        return list(OBSERVATION_KINDS)
+
+    @app.post("/api/observations")
+    def add_observation(body: ObservationIn):
+        pen_or_404(body.pen)
+        ts = parse_iso(body.ts) if body.ts else datetime.now()
+        try:
+            oid = st.add_observation(body.pen, ts, body.kind, body.severity, body.note, body.by)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return dict(st.q1("SELECT * FROM observations WHERE id=?", (oid,)))
+
+    @app.get("/api/pens/{pen}/observations")
+    def get_observations(pen: str, days: float = 30):
+        pen_or_404(pen)
+        return [dict(r) for r in st.observations(pen, since=datetime.now() - timedelta(days=days))]
+
+    @app.get("/api/pens/{pen}/validation")
+    def get_validation(pen: str, since: str | None = None, until: str | None = None):
+        pen_or_404(pen)
+        start = parse_iso(since) if since else datetime.combine(cfg.placement_date, datetime.min.time())
+        end = parse_iso(until) if until else datetime.now()
+        return validate(st, pen, start, end)
 
     @app.post("/api/environment")
     def environment(body: EnvIn):

@@ -28,9 +28,7 @@ def render_preview(cfg: Config, camera_id: str, image_path: str | Path, when: da
     if img is None:
         raise IOError(f"cannot read {image_path}")
     img = cv2.resize(img, geo.work_size, interpolation=cv2.INTER_AREA)
-    seg = build_segmenter({**cfg.analysis["segmenter"], "kind": "color"}
-                          if cfg.analysis["segmenter"]["kind"] == "external"
-                          else cfg.analysis["segmenter"], root=cfg.root)
+    seg = build_segmenter(cfg.analysis["segmenter"])  # preview always shows the colour segmenter
     mask = cv2.bitwise_and(seg(img), geo.image_mask)
 
     left = img.copy()

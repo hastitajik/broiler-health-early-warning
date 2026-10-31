@@ -106,6 +106,12 @@ section h2{font-size:15px;font-weight:700;margin:0 0 10px}
 .log label{display:flex;flex-direction:column;font-size:13px;color:var(--muted)}
 .log input{border:1px solid var(--line);border-radius:4px;padding:5px 8px;background:var(--tile);width:120px}
 .log .note{width:220px}
+.log select{border:1px solid var(--line);border-radius:4px;padding:5px 8px;background:var(--tile)}
+.hint{font-size:13px;color:var(--muted);margin:-4px 0 10px}
+.obs{list-style:none;padding:0;margin:12px 0 0;font-size:14px}
+.obs li{padding:6px 0;border-top:1px solid var(--line)}
+.obs .meta{font-size:12px;color:var(--muted)}
+#accuracy{margin-top:12px;font-size:14px}
 .toast{position:fixed;inset-inline-start:20px;bottom:20px;background:var(--ink);color:var(--paper);
   padding:8px 14px;border-radius:4px;display:none}
 @media (prefers-reduced-motion:no-preference){.toast{transition:opacity .2s}}
@@ -160,15 +166,44 @@ section h2{font-size:15px;font-weight:700;margin:0 0 10px}
         <button class="btn" type="submit">Log mortality</button>
       </form>
     </section>
+
+    <section class="log" aria-labelledby="vetT">
+      <h2 id="vetT">Vet log</h2>
+      <p class="hint">What the vet or farmer saw. These records are how the system's accuracy is measured.</p>
+      <form id="obsForm">
+        <label>What<select name="kind" required>
+          <option value="clinical_sign">Clinical sign</option>
+          <option value="diagnosis">Diagnosis / lab result</option>
+          <option value="death">Deaths found</option>
+          <option value="treatment">Treatment</option>
+          <option value="vaccination">Vaccination</option>
+          <option value="lighting_change">Lighting change</option>
+          <option value="feed_change">Feed change</option>
+          <option value="equipment_problem">Equipment problem</option>
+          <option value="other">Other</option>
+        </select></label>
+        <label>When<input type="datetime-local" name="ts"></label>
+        <label>Severity<select name="severity"><option value="">-</option><option>mild</option><option>moderate</option><option>severe</option></select></label>
+        <label>Note<input class="note" name="note" required></label>
+        <label>Name<input name="by" required></label>
+        <button class="btn" type="submit">Save observation</button>
+      </form>
+      <div id="accuracy"></div>
+      <ul id="obsList" class="obs"></ul>
+    </section>
   </div>
 </main>
 <div class="toast" id="toast" role="status"></div>
 
 <script>
+// `alt` = the per-bird (detection mode) metric, shown instead when it has data
 const SIG = [
-  {key:"activity", metric:"activity_index", label:"of birds moving", fmt:v=>pct(v)},
+  {key:"activity", metric:"activity_index", label:"of birds moving", fmt:v=>pct(v),
+     alt:{metric:"inactive_frac", label:"of birds inactive", fmt:v=>pct(v)}},
   {key:"distribution", metric:"resource_frac", label:"of birds at feed and water", fmt:v=>pct(v),
-     extra:"periphery_frac", extraLabel:"at walls and corners"},
+     extra:"periphery_frac", extraLabel:"at walls and corners",
+     alt:{metric:"feeder_time_frac", label:"of each bird's time spent at the feeders", fmt:v=>pct(v),
+          extra:"periphery_count_frac", extraLabel:"at walls and corners"}},
   {key:"mortality", metric:"still_candidates", label:"still birds to inspect", fmt:v=>num(v,0)},
   {key:"circadian", metric:"rhythm_corr", label:"similarity of today's rhythm to previous days", fmt:v=>num(v,2),
      extra:"rhythm_amplitude"},
@@ -203,12 +238,14 @@ async function render(){
   if(pen.stale_min==null){fr.textContent="No video processed yet";fr.className="fresh stale"}
   else{fr.textContent=`Last data: ${time(pen.last_slot)}`;fr.className="fresh"+(pen.stale_min>30?" stale":"");
        if(pen.stale_min>30) fr.textContent+=". Has a camera or the processing stopped?"}
-  const names=SIG.flatMap(s=>[s.metric,s.extra].filter(Boolean)).join(",");
-  const [m, hm, ev, cams] = await Promise.all([
+  const names=SIG.flatMap(s=>[s.metric,s.extra,s.alt&&s.alt.metric,s.alt&&s.alt.extra].filter(Boolean)).join(",");
+  const [m, hm, ev, cams, obs, val] = await Promise.all([
     api(`/api/pens/${PEN}/metrics?names=${names}&hours=48`),
     api(`/api/pens/${PEN}/heatmap`), api(`/api/events?pen=${PEN}&status=all&limit=30`),
-    api(`/api/pens/${PEN}/cameras`)]);
+    api(`/api/pens/${PEN}/cameras`), api(`/api/pens/${PEN}/observations?days=14`),
+    api(`/api/pens/${PEN}/validation`)]);
   renderSignals(pen.signals, m.series);
+  renderObservations(obs, val);
   renderPlan(hm);
   renderEvents(ev.filter(e=>e.status!=="resolved"));
   $("cams").innerHTML = cams.map(c=>c.image
@@ -217,8 +254,10 @@ async function render(){
 }
 
 function renderSignals(states, series){
-  $("signals").innerHTML = SIG.map(s=>{
-    const st=states[s.key]||{state:"learning"};
+  $("signals").innerHTML = SIG.map(s0=>{
+    const st=states[s0.key]||{state:"learning"};
+    const altData=s0.alt && ((st.metrics||{})[s0.alt.metric]||{}).value!=null;
+    const s=altData ? {...s0, ...s0.alt} : s0;
     const mm=(st.metrics||{})[s.metric]||{};
     let base="";
     if(mm.baseline!=null) base=`Normal for this age and hour: ${s.fmt(mm.baseline)}`;
@@ -316,6 +355,27 @@ function renderEvents(evs){
     }catch(err){toast("Not saved: "+err.message)}
   }));
 }
+
+const KIND={clinical_sign:"Clinical sign",diagnosis:"Diagnosis",death:"Deaths found",treatment:"Treatment",
+  vaccination:"Vaccination",lighting_change:"Lighting change",feed_change:"Feed change",
+  equipment_problem:"Equipment problem",other:"Other"};
+function renderObservations(obs, val){
+  $("obsList").innerHTML = obs.slice().reverse().slice(0,10).map(o=>
+    `<li><b>${esc(KIND[o.kind]||o.kind)}</b>${o.severity?" ("+esc(o.severity)+")":""}: ${esc(o.note)}
+     <div class="meta">${time(o.ts)}, ${esc(o.by)}</div></li>`).join("");
+  if(!val || !val.vet_problems){$("accuracy").innerHTML="";return}
+  $("accuracy").innerHTML = `Since placement: ${num(val.vet_problems_detected)} of ${num(val.vet_problems)} recorded problems
+    were preceded by an alert (${val.recall==null?"–":pct(val.recall)}); ${val.precision==null?"–":pct(val.precision)} of alerts
+    were followed by a real problem; ${num(val.false_alerts_per_week,1)} false alerts per week.`;
+}
+$("obsForm").addEventListener("submit",async ev=>{
+  ev.preventDefault(); const f=new FormData(ev.target);
+  const ts=f.get("ts") ? f.get("ts").replace("T"," ").slice(0,16).replace(" ","T")+":00" : null;
+  try{await api("/api/observations",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({pen:PEN,kind:f.get("kind"),ts,severity:f.get("severity"),note:f.get("note"),by:f.get("by")})});
+    toast("Observation saved"); ev.target.reset(); load();
+  }catch(err){toast("Not saved: "+err.message)}
+});
 
 $("logForm").date.valueAsDate=new Date();
 $("logForm").addEventListener("submit",async ev=>{

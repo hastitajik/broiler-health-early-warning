@@ -41,6 +41,27 @@ def write_video(path: Path, birds: list[dict], seconds: float = 6.0, seed: int =
     return path
 
 
+def write_video_with_dets(path: Path, birds: list[dict], seconds: float = 12.0, seed: int = 0,
+                          conf: float = 0.9) -> Path:
+    """Video plus MVBroTrack-style per-frame detections in <path>.dets/000001.txt ...
+
+    Each bird may carry "cls" (0 broiler, 1 dead). Box = the drawn ellipse's bounding box.
+    """
+    write_video(path, birds, seconds, seed)
+    d = Path(str(path) + ".dets")
+    d.mkdir(exist_ok=True)
+    for i in range(int(seconds * FPS)):
+        t = i / FPS
+        lines = []
+        for b in birds:
+            x = _reflect(b["x"] + b.get("vx", 0) * t, 20, W - 20)
+            y = _reflect(b["y"] + b.get("vy", 0) * t, 20, H - 20)
+            r = b.get("r", 10)
+            lines.append(f"{b.get('cls', 0)} {x:.2f} {y:.2f} {2 * r:.2f} {1.4 * r:.2f} {conf}")
+        (d / f"{i + 1:06d}.txt").write_text("\n".join(lines))
+    return path
+
+
 def moving_flock(n: int = 12, speed: float = 40, seed: int = 1, r: int = 10) -> list[dict]:
     rng = np.random.default_rng(seed)
     out = []

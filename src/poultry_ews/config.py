@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +30,13 @@ DEFAULT_ANALYSIS: dict[str, Any] = {
                   "weights": "models/broiler-seg.pt", "conf": 0.35,
                   "external_suffix": ".dets.jsonl"},
     "activity": {"moving_speed_m_s": 0.04},
+    "tracking": {"max_dist_m": 0.35, "max_missed": 4, "segment_s": 10.0,
+                 "inactive_speed_m_s": 0.02, "min_track_s": 20.0, "still_radius_m": 0.08},
     "mortality": {"still_speed_m_s": 0.015, "max_moving_frac": 0.05,
                   "min_presence_frac": 0.90, "min_area_factor": 0.4,
                   "max_area_factor": 2.5, "match_radius_m": 0.20,
-                  "alert_after_min": 120, "min_flock_activity": 0.03},
+                  "alert_after_min": 120, "min_flock_activity": 0.03,
+                  "dead_class_min_clips": 2},
     "circadian": {"min_hours": 18, "baseline_days": [2, 7]},
 }
 
@@ -102,6 +105,20 @@ class CameraConfig:
 
 
 @dataclass
+class LightingPeriod:
+    valid_from: date
+    on: time      # lights on
+    off: time     # lights off (may be after midnight: then on > off)
+
+    def is_on(self, t: time) -> bool:
+        if self.on == self.off:
+            return True                      # 24 h light
+        if self.on < self.off:
+            return self.on <= t < self.off
+        return t >= self.on or t < self.off  # dark period inside the day
+
+
+@dataclass
 class Rule:
     id: str
     signal: str
@@ -126,6 +143,15 @@ class Config:
     baseline: dict
     notifications: dict
     rules: list[Rule]
+    lighting: list[LightingPeriod] = field(default_factory=list)
+
+    def lighting_at(self, when: datetime) -> LightingPeriod | None:
+        valid = [p for p in self.lighting if p.valid_from <= when.date()]
+        return max(valid, key=lambda p: p.valid_from) if valid else None
+
+    def lights_on(self, when: datetime) -> bool:
+        p = self.lighting_at(when)
+        return True if p is None else p.is_on(when.time())
 
     # ---- helpers --------------------------------------------------------
     @property
@@ -262,7 +288,13 @@ def load_config(path: str | Path, rules_path: str | Path | None = None) -> Confi
     rules_file = Path(rules_path) if rules_path else root / "configs" / "rules.yaml"
     rules = load_rules(rules_file) if rules_file.exists() else []
 
+    lighting = [LightingPeriod(_to_date(x.get("valid_from", "1970-01-01")),
+                               datetime.strptime(str(x["lights_on"]), "%H:%M").time(),
+                               datetime.strptime(str(x["lights_off"]), "%H:%M").time())
+                for x in raw.get("lighting", []) or []]
+
     return Config(
+        lighting=lighting,
         root=root, farm=raw.get("farm", {}), flock=raw.get("flock", {}), pens=pens, cameras=cams,
         analysis=_deep_merge(DEFAULT_ANALYSIS, raw.get("analysis", {})),
         baseline=_deep_merge(DEFAULT_BASELINE, raw.get("baseline", {})),

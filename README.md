@@ -16,14 +16,20 @@ Cardoen et al., *Multi-camera detection and tracking for individual broiler moni
 
 These are the four signals defined in the project document.
 
-| # | Signal | What is measured | Main metric |
-|---|---|---|---|
-| 1 | **Flock activity index** | Optical flow on the rectified floor map (m/s). Share of bird pixels that are moving | `activity_index` |
-| 2 | **Spatial distribution** | Share of birds at feeders and drinkers, and at walls and corners. Spread of the flock | `resource_frac`, `periphery_frac` |
-| 3 | **Mortality** | A bird that stays motionless in one place for hours while the flock is active. Plus daily mortality entered by hand | still-bird candidates, `daily_mortality_pct` |
-| 4 | **Circadian pattern** | Similarity and strength of the last 24 h rhythm compared with previous days | `rhythm_corr`, `rhythm_amplitude` |
+Each signal is computed in two modes. The colour mode works without any
+training; the per-bird mode needs a detector fine-tuned on this farm
+([`docs/finetune.md`](docs/finetune.md)) and is more accurate.
 
-Methods, references and limitations of each signal: [`docs/signals.md`](docs/signals.md).
+| # | Signal | Colour mode (stage 1) | Per-bird mode (stage 2/3) |
+|---|---|---|---|
+| 1 | **Flock activity** | optical flow: share of bird pixels moving (`activity_index`) | share of inactive birds and speed of active ones from tracks (`inactive_frac`, `active_speed`) |
+| 2 | **Spatial distribution** | share of bird pixels at feed/water and walls/corners (`resource_frac`, `periphery_frac`) | bird counts per zone and each bird's time at the feeders (`resource_count_frac`, `periphery_count_frac`, `feeder_time_frac`) |
+| 3 | **Mortality** | bird-sized blob that never moves for hours while the flock is active | track that never moves, or a bird classified `dead`; plus `bird_count` |
+| 4 | **Daily rhythm** | last 24 h vs usual hourly profile (`rhythm_corr`, `rhythm_amplitude`), dark hours of the lighting programme excluded | same, from per-bird activity |
+
+Daily mortality entered by hand (`daily_mortality_pct`) feeds signal 3 in both modes.
+
+Methods, the paper behind each metric, and limitations: [`docs/signals.md`](docs/signals.md).
 
 **What these cameras cannot see** (last section of the project document): faecal colour and consistency, comb colour, and open-mouth breathing. These need close-up cameras or another method. The system does not alert on them.
 
@@ -34,10 +40,12 @@ DVR / cameras -> farm_data/raw/cam1/2025-12-09/05.45.00-05.50.00RO000.h264
                       |   (one folder per camera; recording time read from the file name)
                       v
   analyzer   -- each clip, sampled at 2 fps:
-     |          bird segmentation -> mapped to the floor (homography, metres)
+     |          birds: colour segmentation, or detector boxes (YOLO / MVBroTrack output)
+     |          -> mapped to the floor (homography, metres)
      |          +- optical flow -> activity                      (signal 1)
      |          +- occupancy map -> distribution                 (signal 2)
-     |          +- always-present, never-moving pixels -> still blobs  (signal 3)
+     |          +- per-bird tracks (detector modes) -> inactivity, speed,
+     |             zone counts, feeder time, still / dead birds  (signals 1-3)
      v
   pipeline   -- cameras of one pen fused per 5-minute slot
      |          baseline: median and MAD at this hour, previous days and previous flocks
@@ -80,7 +88,35 @@ Open the preview and check that:
 
 Each time a camera is moved, add a new version with `--valid-from`. Full guide: [`docs/calibration.md`](docs/calibration.md)
 
-### 2) Process past clips
+### 2) Record reference data from day one
+
+In the panel: **Vet log** (clinical signs, diagnoses, deaths found, treatments,
+lighting changes) and **Daily mortality log**. Put the lighting programme in
+`farm.yaml` (`lighting`). Send temperature and humidity to
+`POST /api/environment` if a sensor is available. Without these records the
+system's accuracy cannot be measured.
+
+```bash
+pews observe --pen pen1 --kind clinical_sign --note "tremors, 5 birds near drinker 2" --by vet
+```
+
+### 3) Fine-tune the detector (recommended)
+
+Starting from the MVBroTrack broiler detector: sample frames, draft boxes,
+correct them, train, evaluate per growth phase. Step by step: [`docs/finetune.md`](docs/finetune.md).
+
+```bash
+pews sample-frames --n 300
+pews prelabel
+# correct the boxes in CVAT / Label Studio, export YOLO to farm_data/labeling/labels_corrected
+pews build-dataset --labels farm_data/labeling/labels_corrected
+pews train
+pews evaluate --weights farm_data/runs/<run>/weights/best.pt
+```
+
+Then set `analysis.segmenter.kind: yolo` and the weights path in `farm.yaml`.
+
+### 4) Process past clips
 
 Process the previous flock's clips first so the baseline exists:
 
@@ -88,7 +124,7 @@ Process the previous flock's clips first so the baseline exists:
 pews process --camera cam1 farm_data/raw/cam1/
 ```
 
-### 3) Run continuously
+### 5) Run continuously
 
 ```bash
 pews watch                    # watches each camera folder and processes new clips
@@ -96,6 +132,15 @@ pews serve --port 8000        # panel: http://<server>:8000/
 ```
 
 To password-protect the panel, set `PEWS_USER` and `PEWS_PASSWORD`. Expose it only on the farm LAN or a VPN.
+
+### 6) Measure accuracy
+
+```bash
+pews validate --pen pen1 --since 2025-11-17 --out report.md
+```
+
+Compares every alert with the vet log: recall, precision, false alerts per
+week, warning time, and how many mortality candidates were really dead.
 
 ### Demo data
 
@@ -127,18 +172,23 @@ src/poultry_ews/
   timeparse.py             recording time from file names
   video.py                 clip reading (mp4 / raw h264) with fast sampling
   geometry.py              homography, floor map and zones (wall / corner / feeder / drinker)
-  segmentation.py          colour (stage 1) | YOLO (stage 2) | external detections (stage 3)
+  segmentation.py          colour segmentation (stage 1)
+  detection.py             per-bird detectors: YOLO, MVBroTrack per-frame output, JSONL
+  tracking.py              floor-plane tracker (Hungarian, metres)
   signals/activity.py      signal 1
   signals/distribution.py  signal 2
   signals/mortality.py     signal 3
   signals/circadian.py     signal 4
+  signals/tracks.py        per-bird metrics for signals 1-3
   analyzer.py              one clip from one camera
   pipeline.py              fusion, baseline, mortality tracking, folder watching
   baseline.py              "normal" by age and hour of day
   alerts.py                alert engine and messages
   api/app.py, static/      web panel
   calibrate.py, preview.py calibration tools
-docs/                      methods, calibration, labelling guide, roadmap
+  finetune.py              frame sampling, pre-labelling, dataset split, training, evaluation
+  validation.py            alerts vs vet log
+docs/                      signals, calibration, fine-tuning, labelling guide, roadmap
 tests/                     tests on synthetic video (pytest)
 scripts/make_demo.py       demo data for the panel
 requirements-ews.txt       early-warning system dependencies
@@ -149,9 +199,9 @@ farm_data/samples/         seven sample frames from cam1 (Nov and Dec 2025)
 
 | Stage | Bird detection | Status |
 |---|---|---|
-| 1 | Colour segmentation, no training needed | **Implemented.** Good enough for activity and distribution. Weak for mortality in dense huddles |
-| 2 | YOLO-seg trained on this farm's frames | Adapter ready. Needs labelled data: [`docs/labeling_guide.md`](docs/labeling_guide.md) |
-| 3 | MVBroTrack multi-view tracking (code in this repository) | Its output reaches the system through `ExternalDetections`; see [`docs/roadmap.md`](docs/roadmap.md) |
+| 1 | Colour segmentation, no training needed | **Implemented.** Flock-level activity and distribution. Weak for mortality in dense huddles |
+| 2 | YOLO detector fine-tuned on this farm's frames, run inline, with floor-plane tracking | **Implemented.** Needs labelled frames: [`docs/finetune.md`](docs/finetune.md) |
+| 3 | MVBroTrack inference output (`segmenter.kind: mvbrotrack`) | **Implemented** for its per-frame detections. Multi-camera ground-plane fusion: [`docs/roadmap.md`](docs/roadmap.md) |
 
 ## License and citation
 
@@ -167,4 +217,4 @@ If you use this work in a paper or report, cite Cardoen et al. (2025) and the MV
 pytest -q
 ```
 
-There are 27 tests. They generate synthetic video with moving and still birds and check: activity, distribution, a mortality alert after 15 minutes of stillness, an activity-drop alert after 3 consecutive slots, idempotent re-processing, and the API.
+There are 40 tests. They generate synthetic video (and detector output) with moving, still and dead birds and check: both activity measures, distribution and feeder time, mortality alerts from stillness and from the dead class, an activity-drop alert after 3 consecutive slots, the lighting programme, the day-wise dataset split, alert validation, idempotent re-processing, and the API.

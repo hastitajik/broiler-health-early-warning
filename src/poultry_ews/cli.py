@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -104,6 +105,86 @@ def cmd_extract(args):
     return 0
 
 
+def cmd_sample(args):
+    from .finetune import sample_frames
+    cfg = _cfg(args)
+    out = Path(args.out)
+    rows = sample_frames(cfg, out, args.n, args.seed, args.camera or None)
+    phases = {}
+    for r in rows:
+        phases[r["phase"]] = phases.get(r["phase"], 0) + 1
+    print(f"wrote {len(rows)} frames to {out / 'images'} ({phases}); manifest: {out / 'manifest.csv'}")
+    return 0
+
+
+def cmd_prelabel(args):
+    from .finetune import default_base_weights, prelabel
+    cfg = _cfg(args)
+    weights = args.weights or default_base_weights(cfg.root)
+    d = Path(args.dir)
+    n = prelabel(Path(weights), d / "images", d / "labels", args.conf, args.imgsz, args.overwrite)
+    print(f"drafted labels for {n} images in {d / 'labels'} with {weights}")
+    return 0
+
+
+def cmd_build_dataset(args):
+    from .finetune import build_dataset
+    d = Path(args.dir)
+    s = build_dataset(d / "images", Path(args.labels) if args.labels else d / "labels",
+                      d / "manifest.csv", Path(args.out), args.classes.split(","),
+                      args.test_frac, args.val_frac, args.seed)
+    print(f"dataset in {args.out}: {s['splits']} (per phase: {s['phases']})")
+    return 0
+
+
+def cmd_train(args):
+    from .finetune import default_base_weights, train
+    cfg = _cfg(args)
+    base = args.base or default_base_weights(cfg.root)
+    best = train(Path(args.data), base, Path(args.out), args.imgsz, args.epochs, args.batch,
+                 args.patience, args.device)
+    print(f"best weights: {best}")
+    print("use them: in farm.yaml set analysis.segmenter.kind: yolo and weights: <that path>")
+    return 0
+
+
+def cmd_evaluate(args):
+    from .finetune import evaluate, evaluation_markdown
+    r = evaluate(Path(args.weights), Path(args.dataset), args.imgsz, device=args.device)
+    md = evaluation_markdown(r)
+    print(md)
+    if args.out:
+        Path(args.out).write_text(md, encoding="utf-8")
+        Path(args.out).with_suffix(".json").write_text(json.dumps(r, indent=2))
+    return 0
+
+
+def cmd_observe(args):
+    from .store import Store
+    cfg = _cfg(args)
+    ts = datetime.strptime(args.ts, "%Y-%m-%d %H:%M") if args.ts else datetime.now()
+    oid = Store(cfg.db_path).add_observation(args.pen, ts, args.kind, args.severity, args.note, args.by)
+    print(f"observation {oid} saved")
+    return 0
+
+
+def cmd_validate(args):
+    from .store import Store
+    from .validation import dump, report_markdown, validate
+    cfg = _cfg(args)
+    since = datetime.strptime(args.since, "%Y-%m-%d") if args.since else \
+        datetime.combine(cfg.placement_date, datetime.min.time())
+    until = datetime.strptime(args.until, "%Y-%m-%d") + timedelta(days=1) if args.until else datetime.now()
+    r = validate(Store(cfg.db_path), args.pen, since, until, args.lead_h, args.lag_h)
+    text = dump(r) if args.json else report_markdown(r)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
 def cmd_log(args):
     from .pipeline import Pipeline
     pct = Pipeline(_cfg(args)).daily_mortality(args.pen, args.date, args.deaths, args.culls, args.note)
@@ -172,6 +253,72 @@ def main(argv=None):
     s.add_argument("--culls", type=int, default=0)
     s.add_argument("--note", default="")
     s.set_defaults(fn=cmd_log)
+
+    # ---- detector fine-tuning (docs/finetune.md) ----
+    s = common(sub.add_parser("sample-frames", help="1) pick frames to label"))
+    s.add_argument("--n", type=int, default=300)
+    s.add_argument("--camera", action="append", help="limit to camera id (repeatable)")
+    s.add_argument("--seed", type=int, default=42)
+    s.add_argument("--out", default="farm_data/labeling")
+    s.set_defaults(fn=cmd_sample)
+
+    s = common(sub.add_parser("prelabel", help="2) draft boxes with an existing model"))
+    s.add_argument("--dir", default="farm_data/labeling")
+    s.add_argument("--weights", default=None, help="default: MVBroTrack yolo11x_1920.pt if downloaded")
+    s.add_argument("--conf", type=float, default=0.25)
+    s.add_argument("--imgsz", type=int, default=1920)
+    s.add_argument("--overwrite", action="store_true")
+    s.set_defaults(fn=cmd_prelabel)
+
+    s = sub.add_parser("build-dataset", help="4) split labelled frames into a YOLO dataset")
+    s.add_argument("--dir", default="farm_data/labeling")
+    s.add_argument("--labels", default=None, help="corrected labels folder (default: <dir>/labels)")
+    s.add_argument("--out", default="farm_data/yolo_dataset")
+    s.add_argument("--classes", default="broiler,dead")
+    s.add_argument("--test-frac", type=float, default=0.2)
+    s.add_argument("--val-frac", type=float, default=0.15)
+    s.add_argument("--seed", type=int, default=42)
+    s.set_defaults(fn=cmd_build_dataset)
+
+    s = common(sub.add_parser("train", help="5) fine-tune the detector"))
+    s.add_argument("--data", default="farm_data/yolo_dataset/data.yaml")
+    s.add_argument("--base", default=None, help="default: MVBroTrack yolo11x_1920.pt, else yolo11s.pt")
+    s.add_argument("--out", default="farm_data/runs")
+    s.add_argument("--imgsz", type=int, default=1280)
+    s.add_argument("--epochs", type=int, default=100)
+    s.add_argument("--batch", type=float, default=0.6, help="<1 = fraction of GPU memory")
+    s.add_argument("--patience", type=int, default=30)
+    s.add_argument("--device", default=None)
+    s.set_defaults(fn=cmd_train)
+
+    s = sub.add_parser("evaluate", help="6) test-set accuracy, overall and per growth phase")
+    s.add_argument("--weights", required=True)
+    s.add_argument("--dataset", default="farm_data/yolo_dataset")
+    s.add_argument("--imgsz", type=int, default=1280)
+    s.add_argument("--device", default=None)
+    s.add_argument("--out", default=None, help="write a markdown report (+ .json)")
+    s.set_defaults(fn=cmd_evaluate)
+
+    s = common(sub.add_parser("observe", help="record a vet / farmer observation (reference data)"))
+    s.add_argument("--pen", required=True)
+    s.add_argument("--kind", required=True,
+                   help="clinical_sign | diagnosis | treatment | vaccination | death | "
+                        "lighting_change | feed_change | equipment_problem | other")
+    s.add_argument("--ts", default=None, help="'YYYY-MM-DD HH:MM' (default: now)")
+    s.add_argument("--severity", default="")
+    s.add_argument("--note", default="")
+    s.add_argument("--by", default="")
+    s.set_defaults(fn=cmd_observe)
+
+    s = common(sub.add_parser("validate", help="compare alerts with vet observations"))
+    s.add_argument("--pen", required=True)
+    s.add_argument("--since", default=None, help="YYYY-MM-DD (default: placement date)")
+    s.add_argument("--until", default=None, help="YYYY-MM-DD (inclusive, default: now)")
+    s.add_argument("--lead-h", type=float, default=72.0, help="alert may precede the problem by this much")
+    s.add_argument("--lag-h", type=float, default=24.0, help="alert may follow the problem by this much")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--out", default=None)
+    s.set_defaults(fn=cmd_validate)
 
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,

@@ -24,6 +24,7 @@ class StillBlob:
     x_m: float
     y_m: float
     area_m2: float
+    kind: str = "still"   # "still" (did not move) or "dead" (detector class)
 
 
 class StillnessAccumulator:
@@ -60,14 +61,20 @@ class StillnessAccumulator:
         return out
 
 
-def merge_blobs(blobs: list[tuple[float, float, float]], radius_m: float
-                ) -> list[tuple[float, float, float]]:
-    """Merge blobs seen by overlapping cameras (same bird, slightly different position)."""
-    merged: list[list[float]] = []
-    for x, y, a in sorted(blobs, key=lambda b: -b[2]):
+def merge_blobs(blobs: list[tuple], radius_m: float) -> list[tuple]:
+    """Merge blobs seen by overlapping cameras (same bird, slightly different position).
+
+    Items are (x, y, area) or (x, y, area, kind); "dead" wins over "still" when merged.
+    """
+    merged: list[list] = []
+    for b in sorted(blobs, key=lambda b: -b[2]):
+        x, y, a = b[:3]
+        kind = b[3] if len(b) > 3 else "still"
         for m in merged:
             if (m[0] - x) ** 2 + (m[1] - y) ** 2 <= radius_m ** 2:
+                if kind == "dead":
+                    m[3] = "dead"
                 break
         else:
-            merged.append([x, y, a])
-    return [tuple(m) for m in merged]  # type: ignore[misc]
+            merged.append([x, y, a, kind])
+    return [tuple(m) for m in merged]

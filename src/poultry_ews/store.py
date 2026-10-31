@@ -48,7 +48,23 @@ CREATE TABLE IF NOT EXISTS daily_log (
 CREATE TABLE IF NOT EXISTS environment (
     pen TEXT, ts TEXT, temp_c REAL, rh REAL, PRIMARY KEY (pen, ts)
 );
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, pen TEXT, ts TEXT, kind TEXT, severity TEXT,
+    note TEXT, by TEXT, created_ts TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_obs ON observations(pen, ts);
 """
+
+# columns added after the first release: (table, column, type)
+MIGRATIONS = [
+    ("camera_results", "track_stats", "TEXT"),
+    ("still_blobs", "kind", "TEXT DEFAULT 'still'"),
+    ("candidates", "dead_votes", "INTEGER DEFAULT 0"),
+]
+
+# kinds of reference observations recorded by the vet / farmer
+OBSERVATION_KINDS = ("clinical_sign", "diagnosis", "treatment", "vaccination", "death",
+                     "lighting_change", "feed_change", "equipment_problem", "other")
 
 
 def iso(ts: datetime) -> str:
@@ -68,6 +84,10 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        for table, col, typ in MIGRATIONS:
+            cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()
 
     @contextmanager
@@ -104,14 +124,19 @@ class Store:
     def put_camera_result(self, slot: datetime, camera: str, pen: str, start: datetime,
                           duration_s: float, n_frames: int, bird_px: float, moving_px: float,
                           speed_sum: float, grid_path: str, snapshot_path: str,
-                          blobs: list[tuple[float, float, float]]):
+                          blobs: list[tuple], track_stats: dict | None = None):
         with self.tx() as c:
-            c.execute("INSERT OR REPLACE INTO camera_results VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            c.execute("INSERT OR REPLACE INTO camera_results (slot_ts, camera, pen, start_ts, "
+                      "duration_s, n_frames, bird_px, moving_px, speed_sum, grid_path, "
+                      "snapshot_path, track_stats) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                       (iso(slot), camera, pen, iso(start), duration_s, n_frames, bird_px,
-                       moving_px, speed_sum, grid_path, snapshot_path))
+                       moving_px, speed_sum, grid_path, snapshot_path,
+                       json.dumps(track_stats) if track_stats is not None else None))
             c.execute("DELETE FROM still_blobs WHERE slot_ts=? AND camera=?", (iso(slot), camera))
-            c.executemany("INSERT INTO still_blobs VALUES (?,?,?,?,?,?)",
-                          [(iso(slot), camera, pen, x, y, a) for x, y, a in blobs])
+            c.executemany("INSERT INTO still_blobs (slot_ts, camera, pen, x_m, y_m, area_m2, kind) "
+                          "VALUES (?,?,?,?,?,?,?)",
+                          [(iso(slot), camera, pen, b[0], b[1], b[2], b[3] if len(b) > 3 else "still")
+                           for b in blobs])
 
     def camera_results(self, pen: str, slot: datetime) -> list[sqlite3.Row]:
         return self.q("SELECT * FROM camera_results WHERE pen=? AND slot_ts=?", (pen, iso(slot)))
@@ -202,6 +227,30 @@ class Store:
     def put_environment(self, pen: str, ts: datetime, temp_c: float | None, rh: float | None):
         with self.tx() as c:
             c.execute("INSERT OR REPLACE INTO environment VALUES (?,?,?,?)", (pen, iso(ts), temp_c, rh))
+
+    def add_observation(self, pen: str, ts: datetime, kind: str, severity: str = "",
+                        note: str = "", by: str = "") -> int:
+        if kind not in OBSERVATION_KINDS:
+            raise ValueError(f"kind must be one of {OBSERVATION_KINDS}")
+        with self.tx() as c:
+            cur = c.execute("INSERT INTO observations (pen, ts, kind, severity, note, by, created_ts) "
+                            "VALUES (?,?,?,?,?,?,?)",
+                            (pen, iso(ts), kind, severity, note, by, iso(datetime.now())))
+            return int(cur.lastrowid)
+
+    def observations(self, pen: str, since: datetime | None = None, until: datetime | None = None,
+                     kinds: tuple[str, ...] | None = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM observations WHERE pen=?", [pen]
+        if since:
+            sql += " AND ts>=?"
+            args.append(iso(since))
+        if until:
+            sql += " AND ts<=?"
+            args.append(iso(until))
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+            args += list(kinds)
+        return self.q(sql + " ORDER BY ts", args)
 
     def latest_environment(self, pen: str, before: datetime | None = None) -> sqlite3.Row | None:
         if before:

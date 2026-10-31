@@ -26,6 +26,7 @@ from .signals.activity import ActivityAccumulator
 from .signals.circadian import baseline_profile, hourly_means, rhythm_metrics
 from .signals.distribution import distribution_metrics, fuse_occupancy
 from .signals.mortality import merge_blobs
+from .signals.tracks import metrics_from_stats
 from .store import Store, iso, parse_iso
 from .timeparse import parse_clip_time, slot_start
 from .video import is_media
@@ -34,7 +35,10 @@ log = logging.getLogger("pews.pipeline")
 
 # metrics that get a baseline + z-score
 ZSCORED = ("activity_index", "mean_speed", "resource_frac", "periphery_frac",
-           "frac_feeder", "frac_drinker", "frac_wall", "frac_corner", "dispersion_entropy")
+           "frac_feeder", "frac_drinker", "frac_wall", "frac_corner", "dispersion_entropy",
+           # detection mode (signals/tracks.py)
+           "inactive_frac", "active_speed", "resource_count_frac", "periphery_count_frac",
+           "feeder_time_frac", "bird_count")
 
 
 class Pipeline:
@@ -84,7 +88,7 @@ class Pipeline:
         self.store.put_camera_result(
             slot, camera_id, cam.pen, start, res.duration_s, res.n_frames, res.bird_px,
             res.moving_px, res.speed_sum, str(grid), self.rel(snap),
-            [(b.x_m, b.y_m, b.area_m2) for b in res.blobs])
+            [(b.x_m, b.y_m, b.area_m2, b.kind) for b in res.blobs], res.track_stats)
         self.store.mark_clip(str(clip), camera_id, start, slot, "done")
         log.info("%s %s slot %s: %d frames, bird_px=%.0f, still blobs=%d",
                  camera_id, clip.name, slot, res.n_frames, res.bird_px, len(res.blobs))
@@ -118,7 +122,11 @@ class Pipeline:
         fused_path = self._grid_path(pen_id, slot, "fused")
         np.savez_compressed(fused_path, occupancy=occ.astype(np.float16), coverage=cov)
 
-        metrics.update(self._circadian(pen_id, slot, metrics.get("activity_index")))
+        stats = [json.loads(r["track_stats"]) for r in rows if r["track_stats"]]
+        if stats:
+            metrics.update(metrics_from_stats(stats))
+
+        metrics.update(self._circadian(pen_id, slot, metrics))
 
         for name, value in metrics.items():
             if value is None:
@@ -131,7 +139,10 @@ class Pipeline:
                 st.put_metric(cfg.flock_id, pen_id, slot, age, name, value)
 
         snaps = [r["snapshot_path"] for r in rows if r["snapshot_path"]]
-        self._track_mortality(pen_id, slot, metrics.get("activity_index"), rows)
+        activity_now = metrics.get("activity_index")
+        if metrics.get("inactive_frac") is not None:
+            activity_now = 1.0 - metrics["inactive_frac"]
+        self._track_mortality(pen_id, slot, activity_now, rows)
         n_watch = len(st.candidates(pen_id, ("alerted",)))
         st.put_metric(cfg.flock_id, pen_id, slot, age, "still_candidates", float(n_watch))
         # snapshots are copied to media/events only when an event is actually created
@@ -139,33 +150,57 @@ class Pipeline:
         return metrics
 
     # ------------------------------------------------------------ circadian
-    def _circadian(self, pen: str, slot: datetime, current: float | None) -> dict[str, float | None]:
+    def _circadian(self, pen: str, slot: datetime, metrics: dict) -> dict[str, float | None]:
+        """Rhythm of the last 24 h vs the usual hourly profile.
+
+        Uses the track-based activity (1 - inactive_frac) when a detector is
+        configured, otherwise the optical-flow activity_index. Dark hours of the
+        lighting programme are left out (the camera may not see, and birds rest),
+        and no rhythm is reported for 48 h after a lighting change.
+        """
         c = self.cfg.analysis["circadian"]
-        recent = self.store.metric_series(pen, "activity_index", since=slot - timedelta(hours=24),
-                                          until=slot, flock_id=self.cfg.flock_id)
-        recent_rows = [(parse_iso(r["slot_ts"]), r["value"]) for r in recent]
-        if current is not None and not any(t == slot for t, _ in recent_rows):
-            recent_rows.append((slot, current))
+        none = {"rhythm_corr": None, "rhythm_amplitude": None}
+        use_tracks = metrics.get("inactive_frac") is not None
+        name = "inactive_frac" if use_tracks else "activity_index"
+        current = metrics.get(name)
+        conv = (lambda v: None if v is None else 1.0 - v) if use_tracks else (lambda v: v)
+
+        period = self.cfg.lighting_at(slot)
+        if period is not None and slot.date() <= period.valid_from + timedelta(days=2) and \
+                any(p.valid_from < period.valid_from for p in self.cfg.lighting):
+            return none  # lighting programme changed recently: the old rhythm is not comparable
+
+        def rows(since, until):
+            out = []
+            for r in self.store.metric_series(pen, name, since=since, until=until,
+                                              flock_id=self.cfg.flock_id):
+                ts = parse_iso(r["slot_ts"])
+                if self.cfg.lights_on(ts):
+                    out.append((ts, conv(r["value"])))
+            return out
+
+        recent_rows = rows(slot - timedelta(hours=24), slot)
+        if current is not None and not any(t == slot for t, _ in recent_rows) and self.cfg.lights_on(slot):
+            recent_rows.append((slot, conv(current)))
         d0, d1 = c["baseline_days"]
-        base = self.store.metric_series(pen, "activity_index",
-                                        since=slot - timedelta(days=int(d1)),
-                                        until=slot - timedelta(days=int(d0) - 1),
-                                        flock_id=self.cfg.flock_id)
-        usual = baseline_profile([(parse_iso(r["slot_ts"]), r["value"]) for r in base])
-        return rhythm_metrics(hourly_means(recent_rows), usual, int(c["min_hours"]))
+        usual = baseline_profile(rows(slot - timedelta(days=int(d1)), slot - timedelta(days=int(d0) - 1)))
+        lit_hours = sum(1 for h in range(24) if self.cfg.lights_on(slot.replace(hour=h, minute=30)))
+        min_hours = min(int(c["min_hours"]), max(6, lit_hours - 2))
+        return rhythm_metrics(hourly_means(recent_rows), usual, min_hours)
 
     # ------------------------------------------------------------ mortality
     def _track_mortality(self, pen: str, slot: datetime, activity: float | None, rows):
         m = self.cfg.analysis["mortality"]
         radius = float(m["match_radius_m"])
-        blobs = merge_blobs([(b["x_m"], b["y_m"], b["area_m2"]) for b in self.store.blobs(pen, slot)],
-                            radius)
+        blobs = merge_blobs([(b["x_m"], b["y_m"], b["area_m2"], b["kind"] or "still")
+                             for b in self.store.blobs(pen, slot)], radius)
         active = activity is not None and activity >= float(m["min_flock_activity"])
         gap = timedelta(minutes=2 * self.slot_min)
         cands = [dict(c) for c in self.store.candidates(pen, ("open", "alerted"))]
         matched: set[int] = set()
 
-        for x, y, a in blobs:
+        dead_min = int(m.get("dead_class_min_clips", 2))
+        for x, y, a, kind in blobs:
             best, best_d = None, radius
             for c in cands:
                 if c["id"] in matched:
@@ -178,6 +213,8 @@ class Pipeline:
                     best, best_d = c, d
             if best is None:
                 cid = self.store.add_candidate(pen, slot, x, y, a, float(self.slot_min), active)
+                if kind == "dead":
+                    self.store.update_candidate(cid, dead_votes=1)
                 matched.add(cid)
                 continue
             matched.add(best["id"])
@@ -185,10 +222,12 @@ class Pipeline:
                 continue  # slot fused again (another camera arrived): already counted
             best["still_min"] += self.slot_min
             best["active_seen"] = int(best["active_seen"] or active)
+            best["dead_votes"] = int(best.get("dead_votes") or 0) + (1 if kind == "dead" else 0)
             self.store.update_candidate(best["id"], last_slot=iso(slot), still_min=best["still_min"],
-                                        active_seen=best["active_seen"])
-            if (best["status"] == "open" and best["still_min"] >= float(m["alert_after_min"])
-                    and best["active_seen"]):
+                                        active_seen=best["active_seen"], dead_votes=best["dead_votes"])
+            by_stillness = best["still_min"] >= float(m["alert_after_min"]) and best["active_seen"]
+            by_dead_class = best["dead_votes"] >= dead_min
+            if best["status"] == "open" and (by_stillness or by_dead_class):
                 snaps = self._annotate_candidate(pen, slot, best, rows)
                 eid = self.alerts.raise_mortality_candidate(pen, slot, best, snaps)
                 self.store.update_candidate(best["id"], status="alerted", event_id=eid)

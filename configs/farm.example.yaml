@@ -87,18 +87,31 @@ analysis:
   floor_px_per_m: 100              # resolution of the rectified floor map
   slot_minutes: 5                  # clips are grouped into 5-minute time slots
   segmenter:
-    kind: "color"                  # color | yolo | external
-    # color segmenter (stage 1, no training needed)
+    # color      stage 1: colour segmentation, no training (flock-level signals only)
+    # yolo       stage 2: your fine-tuned detector run inline (see docs/finetune.md)
+    # mvbrotrack stage 3: per-frame detections written by the MVBroTrack code into <clip>.dets/
+    # external   any other tool: <clip>.dets.jsonl
+    kind: "color"
+    # color segmenter
     contrast: 18                   # bird must be this much brighter than local floor (LAB L)
     v_min: 140
     s_max: 120
-    # yolo segmenter (stage 2)
-    weights: "models/broiler-seg.pt"
+    # yolo detector
+    weights: "farm_data/runs/<run>/weights/best.pt"
     conf: 0.35
-    # external detections (e.g. exported from MVBroTrack): <clip>.jsonl next to the clip
+    imgsz: 1280
+    device: null                   # null = auto, "cpu", "0" = first GPU
+    mvbrotrack_suffix: ".dets"
     external_suffix: ".dets.jsonl"
   activity:
     moving_speed_m_s: 0.04         # a bird pixel faster than this counts as "moving"
+  tracking:                        # detection modes only
+    max_dist_m: 0.35               # max jump of one bird between two sampled frames
+    max_missed: 4                  # frames a track may be lost before it ends
+    segment_s: 10                  # length of the segments used for inactive / active
+    inactive_speed_m_s: 0.02       # net speed below this = inactive segment
+    min_track_s: 20                # shortest track used for per-bird feeder time
+    still_radius_m: 0.08           # a track that never leaves this radius is "still"
   mortality:
     still_speed_m_s: 0.015         # slower than this = not moving
     max_moving_frac: 0.05          # a pixel may move in at most 5% of frames to be "still"
@@ -108,9 +121,15 @@ analysis:
     match_radius_m: 0.20           # same candidate across clips if within this distance
     alert_after_min: 120           # still for this long during flock activity -> alert
     min_flock_activity: 0.03       # pen activity_index must reach this at least once meanwhile
+    dead_class_min_clips: 2        # detection mode: "dead" class in this many clips -> alert
   circadian:
     min_hours: 18                  # hours of data needed in the last 24 h
     baseline_days: [2, 7]          # compare with the hourly profile of 2..7 days ago
+
+# Lighting programme. Dark hours are left out of the rhythm signal, and the
+# rhythm is not judged for 2 days after a change. Add a new entry for every change.
+lighting:
+  - {valid_from: "2025-11-01", lights_on: "00:00", lights_off: "00:00"}   # PLACEHOLDER: 24 h light; e.g. "05:00" and "23:00"
 
 baseline:
   hour_window: 1                   # +- hours of day

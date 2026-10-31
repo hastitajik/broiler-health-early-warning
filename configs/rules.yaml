@@ -82,3 +82,45 @@ rules:
     crit: 0.35
     persist: 6
     cooldown_min: 360
+
+  # ---- Detection mode (stage 2/3, per-bird detector configured) ------------
+  # Same signals measured per bird; these metrics stay empty in colour mode.
+  - id: inactivity_rise
+    signal: activity
+    metric: inactive_frac
+    kind: zscore
+    direction: high
+    warn: 2.0
+    crit: 3.0
+    persist: 3
+    cooldown_min: 120
+
+  - id: active_speed_drop
+    signal: activity
+    metric: active_speed
+    kind: zscore
+    direction: low
+    warn: 2.0
+    crit: 3.0
+    persist: 3
+    cooldown_min: 120
+
+  - id: feeder_time_drop
+    signal: distribution
+    metric: feeder_time_frac
+    kind: zscore
+    direction: low
+    warn: 2.0
+    crit: 3.0
+    persist: 3
+    cooldown_min: 120
+
+  - id: periphery_count_rise
+    signal: distribution
+    metric: periphery_count_frac
+    kind: zscore
+    direction: high
+    warn: 2.0
+    crit: 3.0
+    persist: 3
+    cooldown_min: 120

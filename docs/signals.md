@@ -102,3 +102,58 @@ At least 18 hours of data in the last 24 hours are needed.
 **Reference:** Roberts, Cain and Dawkins (2012): welfare problems predicted 1 to 2 days early from changes in optical-flow patterns.
 
 **Limitation:** any change to the lighting programme (dark hours) changes the rhythm. Record these changes and tell the vet.
+
+---
+
+## Detection mode: the same signals per bird
+
+When a per-bird detector is configured (`analysis.segmenter.kind: yolo`,
+`mvbrotrack` or `external`), every sampled frame yields bird boxes. Box centres
+are projected to floor metres and linked into tracks with the Hungarian
+algorithm on distance (`tracking.py`). The colour-based metrics above are still
+computed (from the boxes), and these per-bird metrics are added
+(`signals/tracks.py`):
+
+| Signal | Metric | Definition | Source of the method |
+|---|---|---|---|
+| 1 | `inactive_frac` | share of 10-s track segments with net speed below 2 cm/s | proportion of inactivity, Hernandez et al., Poultry Science 2026 |
+| 1 | `active_speed` | mean net speed of the active segments (m/s) | mean speed of active segments, same paper |
+| 2 | `feeder_time_frac` | mean share of time each bird (track >= 20 s) spends in a feeder zone | time near the food source, Scheidwasser et al., R. Soc. Open Sci. 2025 (41% lower in E. coli-infected birds) |
+| 2 | `resource_count_frac`, `periphery_count_frac` | share of detected birds at feed + water, and at walls + corners | zone counts, Guo et al., Sensors 2020 |
+| 3 | still / dead points | a track that covers 90% of the clip without leaving an 8 cm radius, or a track mostly classified `dead` | stationary persistence, Hao et al., Agriculture 2025 |
+| 3 | `bird_count` | mean number of birds detected per frame | |
+| 4 | `rhythm_corr`, `rhythm_amplitude` | computed from `1 - inactive_frac` instead of the optical-flow index | |
+
+Rules for these metrics are in `configs/rules.yaml` (`inactivity_rise`,
+`active_speed_drop`, `feeder_time_drop`, `periphery_count_rise`). The panel
+shows the per-bird metric of a signal as soon as it has data.
+
+A dead-class detection in `mortality.dead_class_min_clips` (default 2)
+consecutive clips at the same spot raises a mortality alert without waiting
+for the stillness timer.
+
+Track identities are kept only within a clip and per camera. With overlapping
+cameras, counts are summed across cameras and can double-count birds in the
+overlap; the MVBroTrack ground-plane fusion is the way to remove that.
+
+## Lighting programme
+
+`lighting` in `farm.yaml` lists the programme with the date it started.
+Dark hours are left out of the rhythm comparison, and the rhythm is not
+judged for 2 days after a change, so a new programme does not look like disease.
+
+## Measuring accuracy on this farm
+
+Published numbers come from other houses, cameras and flocks. Accuracy on
+this farm is measured against the vet log:
+
+```bash
+pews validate --pen pen1 --since 2025-11-17 --until 2025-12-31 --out report.md
+```
+
+An alert counts as correct when a vet-recorded problem (clinical sign,
+diagnosis or deaths) follows it within 72 h or preceded it by at most 24 h.
+The report gives recall (problems that were preceded by an alert), precision,
+false alerts per week, median warning time and the share of mortality
+candidates that were really dead. The panel shows the same summary under
+Vet log.
