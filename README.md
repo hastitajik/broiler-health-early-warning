@@ -1,207 +1,170 @@
-# Multi-View Broiler Tracking
+# Broiler Early-Warning System
 
-![Multi-View Tracking](visualizations/camera_setup_animation.gif)
+This system analyses the 5-minute clips recorded by overhead cameras in a broiler house. It extracts four flock-health signals and compares each one with what is normal for the same flock age and the same hour of day. When something is off, it raises an alert by itself. A web panel shows the current state of the four signals to the farmer and the veterinarian whenever they open it.
 
-This repository accompanies [**Multi-camera Detection and Tracking for Individual Broiler Monitoring**](https://www.sciencedirect.com/science/article/abs/pii/S0168169925005411): a pipeline for single-view detection, multi-view ground-plane detection, and multi-view tracking of broilers across their lifespan.
+This repository is built on the code of the **MVBroTrack** paper:
+Cardoen et al., *Multi-camera detection and tracking for individual broiler monitoring*, Computers and Electronics in Agriculture, 2025.
 
-- **Setup and codebase** — [Getting Started](#getting-started) (clone, conda, `install.sh`, `PYTHONPATH`) and [Main Scripts](#main-scripts) (`sv_main.py`, `mv_main.py`, `mvt_main.py`).
-- **MVBroTrack** — [Dataset download, label overview, and visualizers](#mvbrotrack-dataset) (`scripts/visualize_*.py`).
-- **Reference** — [Citation](#reference) for the paper and dataset.
+- The paper's code is kept unchanged, with its full history, at the root of this repository: `sv_main.py`, `mv_main.py`, `mvt_main.py` and the `single_camera_*` and `ground_plane_*` folders.
+- Its original README is [`README_MVBroTrack.md`](README_MVBroTrack.md).
+- The early-warning system lives next to it in `src/poultry_ews/`.
 
-## Getting Started
+> This tool does not replace a veterinary examination. Its job is to tell you earlier where to look.
+> Alert thresholds must be tuned with the project veterinarian on this farm's own data.
 
-### Clone (with submodules)
+## The four signals
+
+These are the four signals defined in the project document.
+
+| # | Signal | What is measured | Main metric |
+|---|---|---|---|
+| 1 | **Flock activity index** | Optical flow on the rectified floor map (m/s). Share of bird pixels that are moving | `activity_index` |
+| 2 | **Spatial distribution** | Share of birds at feeders and drinkers, and at walls and corners. Spread of the flock | `resource_frac`, `periphery_frac` |
+| 3 | **Mortality** | A bird that stays motionless in one place for hours while the flock is active. Plus daily mortality entered by hand | still-bird candidates, `daily_mortality_pct` |
+| 4 | **Circadian pattern** | Similarity and strength of the last 24 h rhythm compared with previous days | `rhythm_corr`, `rhythm_amplitude` |
+
+Methods, references and limitations of each signal: [`docs/signals.md`](docs/signals.md).
+
+**What these cameras cannot see** (last section of the project document): faecal colour and consistency, comb colour, and open-mouth breathing. These need close-up cameras or another method. The system does not alert on them.
+
+## Data flow
+
+```
+DVR / cameras -> farm_data/raw/cam1/2025-12-09/05.45.00-05.50.00RO000.h264
+                      |   (one folder per camera; recording time read from the file name)
+                      v
+  analyzer   -- each clip, sampled at 2 fps:
+     |          bird segmentation -> mapped to the floor (homography, metres)
+     |          +- optical flow -> activity                      (signal 1)
+     |          +- occupancy map -> distribution                 (signal 2)
+     |          +- always-present, never-moving pixels -> still blobs  (signal 3)
+     v
+  pipeline   -- cameras of one pen fused per 5-minute slot
+     |          baseline: median and MAD at this hour, previous days and previous flocks
+     |          24 h rhythm                                      (signal 4)
+     |          still-bird candidates tracked across clips
+     v
+  alerts     -- rules in configs/rules.yaml (z-score / threshold, persistence, cooldown)
+     v
+  SQLite -> web panel (FastAPI) + webhook notifications
+```
+
+## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/decide-ugent/multi-view-broiler-tracking.git
-cd multi-view-broiler-tracking
+# --recurse-submodules: the MVBroTrack code needs the sort and mot3d submodules
+git clone --recurse-submodules <this-repo> && cd <repo>
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"            # early-warning system only (requirements-ews.txt)
+# to run the MVBroTrack code itself: README_MVBroTrack.md (conda + ./install.sh + requirements.txt)
+
+cp configs/farm.example.yaml configs/farm.yaml
+cp configs/cameras/cam1.example.yaml configs/cameras/cam1.yaml
+# in farm.yaml: pen dimensions, placement date, bird count, cameras and pens
 ```
 
-### Installation
-
-**Dataset:** Download and unzip [MVBroTrack](#mvbrotrack-dataset) into `DATA/` before running training, evaluation, or the visualization scripts (default location: `DATA/MVBroTrack`).
-
-#### System dependencies (Linux)
-
-Install these before running `./install.sh` (needed to build the muSSP native extension):
-
-| Package | Purpose |
-|---|---|
-| `unzip` | Extract `mussp-master-6cf61b8.zip` |
-| `cmake` | Configure the muSSP C++ wrapper build |
-| `build-essential` | C/C++ compiler and `make` |
-| `libboost-python-dev` | Boost.Python headers/libs for the wrapper |
-
-On Debian/Ubuntu:
+### 1) Calibrate each camera
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y unzip cmake build-essential libboost-python-dev
+# on a computer with a display (full opencv-python, not headless):
+pews calibrate --camera cam1 --image frame.png --valid-from 2025-12-01
+
+# after every change, look at the preview:
+pews preview --camera cam1 --image frame.png --out preview.jpg
 ```
 
-On other platforms, install equivalent packages (see `mot3d/README.md` for Windows notes).
+Open the preview and check that:
+- the green 50 cm grid sits on the floor,
+- the feeder and drinker circles are around the equipment,
+- birds are red and the litter is not.
 
-#### Python environment
+Each time a camera is moved, add a new version with `--valid-from`. Full guide: [`docs/calibration.md`](docs/calibration.md)
 
-Create and activate a conda environment, then run the install script:
+### 2) Process past clips
+
+Process the previous flock's clips first so the baseline exists:
 
 ```bash
-conda create -n mvbroilertracking python=3.10 -y
-conda activate mvbroilertracking
-./install.sh
+pews process --camera cam1 farm_data/raw/cam1/
 ```
 
-`install.sh` installs Python dependencies and builds the muSSP native extension under `mot3d/`. It does **not** install system packages. After installation, add `mot3d` to your `PYTHONPATH` when running the tracking scripts:
+### 3) Run continuously
 
 ```bash
-export PYTHONPATH="$PWD/mot3d:$PYTHONPATH"
+pews watch                    # watches each camera folder and processes new clips
+pews serve --port 8000        # panel: http://<server>:8000/
 ```
 
----
+To password-protect the panel, set `PEWS_USER` and `PEWS_PASSWORD`. Expose it only on the farm LAN or a VPN.
 
-## Main Scripts
-
-All three scripts are run from the repository root and expect MVBroTrack in `DATA/MVBroTrack` (see [MVBroTrack Dataset](#mvbrotrack-dataset)). Tracker caches, evaluation CSVs, and other generated outputs also go under `DATA/` (see `utils/paths.py`).
-
-### `mvt_main.py` — Multi-View Ground-Plane Tracking
-
-Runs multi-view tracking on top of the ground-plane detections. Four tracking methods are available, covering both tracking-by-detection (TBD) and tracking-by-curve-matching (TBCM) approaches:
-
-| Method flag | Description |
-|---|---|
-| `muSSP3D` | TBD using muSSP global optimisation directly on 3D detections |
-| `sort_3D` | TBD using SORT on 3D detections per frame |
-| `muSSP_curve` | TBCM — 2D single-camera tracklets fused as curves via muSSP |
-| `sort_curve` | TBCM — 2D single-camera tracklets fused as curves via SORT |
-
-Default configs for each method live in `ground_plane_tracking/yml_configs/`. Fold-specific tuned parameters are in `ground_plane_tracking/yml_tuned/`.
-
-**Reproducing the paper results** (`--fold all`, the default) runs all five stratified folds using the per-fold tuned parameters and saves one CSV per fold to `DATA/final_summaries/` as `{method}_{fold_N}_{eval_set}.csv` (default `eval_set=val`, matching the paper half on current scikit-learn).
+### Demo data
 
 ```bash
-export PYTHONPATH="$PWD/mot3d:$PYTHONPATH"
-
-# Reproduce paper results — all 5 folds, tuned params, paper test split
-python mvt_main.py --method sort_3D --eval_set test
-python mvt_main.py --method muSSP3D --eval_set test
-python mvt_main.py --method sort_curve --eval_set test
-python mvt_main.py --method muSSP_curve --eval_set test
-
-# combine the results in a single table
-python -m scripts.produce_final_tracking_paper_results_table
+python scripts/make_demo.py
+pews serve --config demo/configs/farm.yaml
 ```
 
-### `mv_main.py` — Multi-View Ground-Plane Detection
+The demo data is simulated, not real.
 
-Projects single-view bounding boxes to the ground plane via camera calibration, fuses detections across all four camera views, and evaluates using MOD metrics (MODA / MODP / Precision / Recall). Supports 5-fold cross-validation and hyperparameter tuning.
+## Repository layout
+
+```
+-- MVBroTrack paper code (unchanged) --
+sv_main.py, mv_main.py, mvt_main.py   single-view detection, ground-plane detection, multi-view tracking
+single_camera_detection/, single_camera_tracking/
+ground_plane_detection/, ground_plane_tracking/
+utils/, scripts/visualize_*.py, install.sh, requirements.txt
+sort/, mot3d/                         submodules
+README_MVBroTrack.md                  original README of that repository
+LICENSE                               AGPL-3.0 (whole repository)
+
+-- early-warning system --
+configs/
+  farm.example.yaml        pens, cameras, dated equipment layouts, analysis parameters
+  cameras/cam1.example.yaml  calibration (dated versions)
+  rules.yaml               alert rules for all four signals
+src/poultry_ews/
+  timeparse.py             recording time from file names
+  video.py                 clip reading (mp4 / raw h264) with fast sampling
+  geometry.py              homography, floor map and zones (wall / corner / feeder / drinker)
+  segmentation.py          colour (stage 1) | YOLO (stage 2) | external detections (stage 3)
+  signals/activity.py      signal 1
+  signals/distribution.py  signal 2
+  signals/mortality.py     signal 3
+  signals/circadian.py     signal 4
+  analyzer.py              one clip from one camera
+  pipeline.py              fusion, baseline, mortality tracking, folder watching
+  baseline.py              "normal" by age and hour of day
+  alerts.py                alert engine and messages
+  api/app.py, static/      web panel
+  calibrate.py, preview.py calibration tools
+docs/                      methods, calibration, labelling guide, roadmap
+tests/                     tests on synthetic video (pytest)
+scripts/make_demo.py       demo data for the panel
+requirements-ews.txt       early-warning system dependencies
+farm_data/samples/         seven sample frames from cam1 (Nov and Dec 2025)
+```
+
+## Development stages
+
+| Stage | Bird detection | Status |
+|---|---|---|
+| 1 | Colour segmentation, no training needed | **Implemented.** Good enough for activity and distribution. Weak for mortality in dense huddles |
+| 2 | YOLO-seg trained on this farm's frames | Adapter ready. Needs labelled data: [`docs/labeling_guide.md`](docs/labeling_guide.md) |
+| 3 | MVBroTrack multi-view tracking (code in this repository) | Its output reaches the system through `ExternalDetections`; see [`docs/roadmap.md`](docs/roadmap.md) |
+
+## License and citation
+
+The MVBroTrack code is released under **AGPL-3.0** and this repository is built on it, so the whole repository, including the early-warning system, is under the same license ([`LICENSE`](LICENSE)).
+
+If you offer this system to others as a web service, you must also make its source code, including your changes, available to them.
+
+If you use this work in a paper or report, cite Cardoen et al. (2025) and the MVBroTrack dataset. The citation is in `README_MVBroTrack.md`.
+
+## Tests
 
 ```bash
-# Evaluate all folds
-python mv_main.py --action test
-
-# Evaluate on a specific camera subset
-python mv_main.py --action test --cam_set 9 10
-
-# Tune hyperparameters on one fold
-python mv_main.py --action tune --fold fold_1
+pytest -q
 ```
 
----
-
-### `sv_main.py` — Single-View Detection (YOLO)
-
-Handles 5-fold cross-validation training, final model training, and inference for single-view broiler detection using YOLO. 
-
-```bash
-# Train a single fold
-python sv_main.py train_single_fold --fold fold_1 --image_size 1920 --model yolo11x.pt
-
-# Validate a trained fold model
-python sv_main.py validate --fold fold_1 --image_size 1920 --model yolo11x
-
-# Train final model on all data
-python sv_main.py train_final_model --model yolo11x.pt --image_size 1920
-
-# Run inference on images (uses bundled weights or a trained run under DATA/GENERATED_DATA/)
-python sv_main.py gather_detections --image_size 1920
-```
-
----
-
-## MVBroTrack Dataset
-
-Download and unzip into `DATA/`:
-
-```bash
-mkdir -p DATA
-wget https://datasets.ilabt.imec.be/broilertracking/MVBroTrack_v2.zip -O DATA/MVBroTrack_v2.zip
-unzip DATA/MVBroTrack_v2.zip -d DATA
-rm DATA/MVBroTrack_v2.zip
-```
-
-After unzipping, the dataset root (`DATA/MVBroTrack` by default) should contain `Single-View-Detection/`, `Multi-View-Detection/`, `Multi-View-Tracking/`, `Calibrations/`, and `Reprojection_Masks/`. Set `MVBROTRACK_DATASET_ROOT` to override the default for all scripts, or pass `--root_dataset` to `mv_main.py` and `--dataset_root` to the visualization scripts.
-
-The MVBroTrack dataset covers broilers across three growth stages (Starter, Grower, Finisher) and provides annotations for single-view detection, multi-view detection, and multi-view tracking.
-
-**Visualizers** (run from the repository root with `python -m`, same as other entry points; deps from `install.sh`):
-
-```bash
-# single-view images with bounding boxes
-python -m scripts.visualize_single_view_dataset 
-
-# four-camera grid, ground-plane GT, optional YOLO via `--yolo_labels_folder`, confidence trackbar
-python -m scripts.visualize_ground_plane_detection_dataset 
-
-# synchronized playback with ground-plane track history (e.g. `--start-frame 400`)
-python -m scripts.visualize_ground_plane_tracking_dataset 
-```
-
-
-
-### Labels per Subtask
-
-| Task | Stage | Frames | Broilers | Image Plane (BBoxes) | Ground Plane (Points) | Ground Plane (Tracks) |
-|---|---|---|---|---|---|---|
-| Single-view detection | Starter | 56 | 4106 | 4106 | - | - |
-| | Grower | 65 | 5714 | 5714 | - | - |
-| | Finisher | 114 | 11414 | 11414 | - | - |
-| | **Total** | **235** | **21234** | **21234** | - | - |
-| Multi-view detection | Starter | 7×4 | 893 | - | 893 | - |
-| | Grower | 21×4 | 2791 | - | 2791 | - |
-| | Finisher | 23×4 | 3022 | - | 3022 | - |
-| | **Total** | **51×4** | **6706** | - | **6706** | - |
-| Multi-view tracking | Starter | 1423×4 | 275 | - | - | 275 |
-| | Grower | 1494×4 | 276 | - | - | 276 |
-| | Finisher | 1439×4 | 265 | - | - | 265 |
-| | **Total** | **4356×4** | **816** | - | - | **816** |
-
-### Single-View Ground Truth Detections
-
-![Single-view GT detections](visualizations/bounding_box_example.png)
-
-### Multi-View Ground Truth Tracks
-
-One camera view out of the four synchronized views, with ground-plane tracks visualized using up to 12 seconds of track history.
-
-![Multi-View GT tracks](visualizations/dataset_tracking_example.gif)
-
----
-
-## Reference
-
-If you found this dataset or the accompanying code useful, please cite:
-
-```bibtex
-@article{CARDOEN2025110435,
-  title   = {Multi-camera detection and tracking for individual broiler monitoring},
-  journal = {Computers and Electronics in Agriculture},
-  volume  = {237},
-  pages   = {110435},
-  year    = {2025},
-  issn    = {0168-1699},
-  doi     = {https://doi.org/10.1016/j.compag.2025.110435},
-  url     = {https://www.sciencedirect.com/science/article/abs/pii/S0168169925005411},
-  author  = {Thorsten Cardoen and Patricia Soster {de Carvalho} and Gunther Antonissen and Frank A.M. Tuyttens and Sam Leroux and Pieter Simoens},
-  keywords = {Multi-camera detection, Object tracking, Broiler welfare monitoring, Sensor fusion}
-}
-```
+There are 27 tests. They generate synthetic video with moving and still birds and check: activity, distribution, a mortality alert after 15 minutes of stillness, an activity-drop alert after 3 consecutive slots, idempotent re-processing, and the API.
