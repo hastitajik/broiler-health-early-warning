@@ -106,7 +106,7 @@ Starting from the MVBroTrack broiler detector: sample frames, draft boxes,
 correct them, train, evaluate per growth phase. Step by step: [`docs/finetune.md`](docs/finetune.md).
 
 ```bash
-pews sample-frames --n 300
+pews sample-frames --n 300          # or: pews import-frames <folders> --placement-date ...
 pews prelabel
 # correct the boxes in CVAT / Label Studio, export YOLO to farm_data/labeling/labels_corrected
 pews build-dataset --labels farm_data/labeling/labels_corrected
@@ -186,9 +186,11 @@ src/poultry_ews/
   alerts.py                alert engine and messages
   api/app.py, static/      web panel
   calibrate.py, preview.py calibration tools
-  finetune.py              frame sampling, pre-labelling, dataset split, training, evaluation
+  finetune.py              frame sampling / import, pre-labelling, CVAT export, dataset split, training, evaluation
+  osd.py                   recording time from the timestamp burned into the frame
   validation.py            alerts vs vet log
 docs/                      signals, calibration, fine-tuning, labelling guide, roadmap
+notebooks/prelabel_colab.ipynb  import and pre-label frames on a free Colab GPU
 tests/                     tests on synthetic video (pytest)
 scripts/make_demo.py       demo data for the panel
 requirements-ews.txt       early-warning system dependencies
@@ -217,4 +219,4 @@ If you use this work in a paper or report, cite Cardoen et al. (2025) and the MV
 pytest -q
 ```
 
-There are 40 tests. They generate synthetic video (and detector output) with moving, still and dead birds and check: both activity measures, distribution and feeder time, mortality alerts from stillness and from the dead class, an activity-drop alert after 3 consecutive slots, the lighting programme, the day-wise dataset split, alert validation, idempotent re-processing, and the API.
+There are 43 tests. They generate synthetic video (and detector output) with moving, still and dead birds and check: both activity measures, distribution and feeder time, mortality alerts from stillness and from the dead class, an activity-drop alert after 3 consecutive slots, the lighting programme, the day-wise dataset split, alert validation, idempotent re-processing, and the API.

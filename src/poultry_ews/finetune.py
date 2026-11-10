@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
@@ -128,7 +129,7 @@ def _read_frame(clip: Path, rng: random.Random):
 
 
 def _write_manifest(path: Path, rows: list[dict], append: bool):
-    fields = ["image", "camera", "clip", "ts", "age_days", "phase", "lights_on"]
+    fields = ["image", "camera", "clip", "ts", "age_days", "phase", "lights_on", "ts_source"]
     exists = path.exists() and append
     with open(path, "a" if exists else "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -143,10 +144,76 @@ def read_manifest(path: Path) -> dict[str, dict[str, str]]:
         return {r["image"]: r for r in csv.DictReader(f)}
 
 
+# --------------------------------------------------------------------------- 1b. import existing frames
+def import_frames(src_dirs: list[Path], out_dir: Path, placement_date: str, camera: str = "cam1",
+                  cfg: Config | None = None, use_osd: bool = True) -> dict[str, Any]:
+    """Copy already-exported frames into <out_dir>/images and write the manifest.
+
+    Recording time: OSD text burned into the frame (osd.py) first, file name as
+    fallback. Frames are renamed <camera>_<YYYYmmdd_HHMMSS>.<ext> so the day is
+    visible; the original name is kept in the manifest `clip` column. Any
+    existing train/val/test folder structure is ignored on purpose: the split is
+    redone by day in `build-dataset`.
+    """
+    from .osd import read_osd_time
+    placed = datetime.strptime(placement_date, "%Y-%m-%d")
+    img_dir = out_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    rows, unreadable, mismatched = [], [], []
+    seen: set[str] = set()
+    files = sorted(f for d in src_dirs for f in Path(d).rglob("*")
+                   if f.is_file() and f.suffix.lower() in IMAGE_EXT)
+    for f in files:
+        ts, src = None, ""
+        if use_osd:
+            try:
+                ts = read_osd_time(f)
+                src = "osd" if ts else ""
+            except Exception:  # pragma: no cover - tesseract missing / unreadable image
+                ts = None
+        try:
+            ts_name = parse_clip_time(f)
+        except (TimestampError, ValueError):
+            ts_name = None
+        if ts_name is not None and ts is not None:
+            # names with only a time range ("05.45.00-05.50.00") have no date: compare times of day
+            d = abs((datetime.combine(ts.date(), ts_name.time()) - ts).total_seconds())
+            if d > 15 * 60 and abs(d - 86400) > 15 * 60:
+                mismatched.append(f.name)
+        if ts is None and ts_name is not None and ts_name.year >= 2000 and not \
+                re.match(r"\d\d[._]\d\d[._]\d\d-", f.name):
+            ts, src = ts_name, "filename"
+        if ts is None:
+            unreadable.append(f.name)
+            continue
+        base = f"{camera}_{ts:%Y%m%d_%H%M%S}"
+        name, k = base + f.suffix.lower(), 1
+        while name in seen:
+            name, k = f"{base}_{k}{f.suffix.lower()}", k + 1
+        seen.add(name)
+        shutil.copy2(f, img_dir / name)
+        age = (ts.date() - placed.date()).days
+        rows.append({"image": name, "camera": camera, "clip": f.name,
+                     "ts": ts.isoformat(timespec="seconds"), "age_days": age, "phase": phase_of(age),
+                     "lights_on": int(cfg.lights_on(ts)) if cfg else "", "ts_source": src})
+    _write_manifest(out_dir / MANIFEST, rows, append=False)
+    days = sorted({r["ts"][:10] for r in rows})
+    phases: dict[str, int] = {}
+    for r in rows:
+        phases[r["phase"]] = phases.get(r["phase"], 0) + 1
+    return {"imported": len(rows), "unreadable": unreadable, "time_mismatch": mismatched,
+            "days": days, "phases": phases}
+
+
 # --------------------------------------------------------------------------- 2. pre-labelling
 def prelabel(weights: Path, images_dir: Path, labels_dir: Path, conf: float = 0.25,
-             imgsz: int = 1920, overwrite: bool = False) -> int:  # pragma: no cover - needs ultralytics
-    """Draft YOLO labels (normalised 'cls cx cy w h') for every image without a label yet."""
+             imgsz: int = 1920, overwrite: bool = False, previews_dir: Path | None = None,
+             device: str | None = None) -> int:  # pragma: no cover - needs ultralytics
+    """Draft YOLO labels (normalised 'cls cx cy w h') for every image without a label yet.
+
+    With `previews_dir`, also writes a JPG per image with the drafted boxes drawn,
+    to judge the pre-trained model at a glance before correcting.
+    """
     from ultralytics import YOLO  # type: ignore
     model = YOLO(str(weights))
     labels_dir.mkdir(parents=True, exist_ok=True)
@@ -159,15 +226,60 @@ def prelabel(weights: Path, images_dir: Path, labels_dir: Path, conf: float = 0.
         out = labels_dir / (img.stem + ".txt")
         if out.exists() and not overwrite:
             continue
-        res = model.predict(str(img), conf=conf, imgsz=imgsz, verbose=False)[0]
+        res = model.predict(str(img), conf=conf, imgsz=imgsz, device=device, verbose=False)[0]
         lines = []
         if res.boxes is not None:
             for (cx, cy, w, h), c in zip(res.boxes.xywhn.tolist(), res.boxes.cls.tolist()):
                 # MVBroTrack models have a single class; everything becomes "broiler" (0)
                 lines.append(f"{0 if c != 1 else 1} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
         out.write_text("\n".join(lines))
+        if previews_dir is not None:
+            draw_labels(img, out, previews_dir / (img.stem + ".jpg"))
         n += 1
     return n
+
+
+def draw_labels(image: Path, label: Path, out: Path, width: int = 1600):
+    """Draw YOLO boxes (green = broiler, red = dead) on an image and save a JPG."""
+    im = cv2.imread(str(image))
+    h, w = im.shape[:2]
+    n = 0
+    for line in label.read_text().splitlines():
+        p = line.split()
+        if len(p) < 5:
+            continue
+        c, cx, cy, bw, bh = int(p[0]), *map(float, p[1:5])
+        x1, y1 = int((cx - bw / 2) * w), int((cy - bh / 2) * h)
+        x2, y2 = int((cx + bw / 2) * w), int((cy + bh / 2) * h)
+        cv2.rectangle(im, (x1, y1), (x2, y2), (0, 0, 255) if c == 1 else (0, 220, 0), 2)
+        n += 1
+    cv2.putText(im, f"{n} boxes", (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 255), 3)
+    s = width / w
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), cv2.resize(im, (width, int(h * s))), [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+
+def export_cvat(images_dir: Path, labels_dir: Path, out_zip: Path,
+                classes: list[str] | None = None) -> int:
+    """Pack images + YOLO labels as a CVAT "YOLO 1.1" archive (import as annotations).
+
+    In CVAT: create a task with the same images, then Actions > Upload annotations >
+    YOLO 1.1 > this zip. After correcting: Export dataset > YOLO 1.1, and unzip the
+    .txt files into a labels folder for `build-dataset`.
+    """
+    import zipfile
+    classes = classes or DEFAULT_CLASSES
+    imgs = sorted(f for f in images_dir.iterdir() if f.suffix.lower() in IMAGE_EXT)
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("obj.names", "\n".join(classes) + "\n")
+        z.writestr("obj.data", f"classes = {len(classes)}\nnames = data/obj.names\n"
+                               "train = data/train.txt\n")
+        z.writestr("train.txt", "\n".join(f"data/obj_train_data/{f.name}" for f in imgs) + "\n")
+        for f in imgs:
+            lab = labels_dir / (f.stem + ".txt")
+            z.writestr(f"obj_train_data/{f.stem}.txt", lab.read_text() if lab.exists() else "")
+    return len(imgs)
 
 
 # --------------------------------------------------------------------------- 4. dataset

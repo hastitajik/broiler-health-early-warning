@@ -118,12 +118,33 @@ def cmd_sample(args):
 
 
 def cmd_prelabel(args):
-    from .finetune import default_base_weights, prelabel
-    cfg = _cfg(args)
-    weights = args.weights or default_base_weights(cfg.root)
+    from .finetune import default_base_weights, export_cvat, prelabel
+    root = Path(args.config).resolve().parent.parent if Path(args.config).exists() else Path.cwd()
+    weights = args.weights or default_base_weights(root)
     d = Path(args.dir)
-    n = prelabel(Path(weights), d / "images", d / "labels", args.conf, args.imgsz, args.overwrite)
+    n = prelabel(Path(weights), d / "images", d / "labels", args.conf, args.imgsz, args.overwrite,
+                 None if args.no_previews else d / "previews", args.device)
     print(f"drafted labels for {n} images in {d / 'labels'} with {weights}")
+    k = export_cvat(d / "images", d / "labels", d / "cvat_prelabels_yolo1.1.zip")
+    print(f"CVAT import archive ({k} images): {d / 'cvat_prelabels_yolo1.1.zip'}")
+    return 0
+
+
+def cmd_import_frames(args):
+    from .finetune import import_frames
+    cfg = None
+    if Path(args.config).exists():
+        cfg = _cfg(args)
+    r = import_frames([Path(p) for p in args.src], Path(args.out), args.placement_date,
+                      args.camera, cfg, not args.no_osd)
+    print(f"imported {r['imported']} frames into {Path(args.out) / 'images'}")
+    print(f"days: {', '.join(r['days'])}")
+    print(f"per growth phase: {r['phases']}")
+    if r["unreadable"]:
+        print(f"no recording time found for {len(r['unreadable'])} frames (skipped): {r['unreadable']}")
+    if r["time_mismatch"]:
+        print(f"OSD time differs from the file name for {len(r['time_mismatch'])} frames, check them: "
+              f"{r['time_mismatch']}")
     return 0
 
 
@@ -262,8 +283,18 @@ def main(argv=None):
     s.add_argument("--out", default="farm_data/labeling")
     s.set_defaults(fn=cmd_sample)
 
+    s = common(sub.add_parser("import-frames", help="1b) use frames you already exported"))
+    s.add_argument("src", nargs="+", help="folders with frames (sub-folders are searched too)")
+    s.add_argument("--placement-date", required=True, help="YYYY-MM-DD, day 0 of the flock")
+    s.add_argument("--camera", default="cam1")
+    s.add_argument("--out", default="farm_data/labeling")
+    s.add_argument("--no-osd", action="store_true", help="do not read the timestamp burned into the frame")
+    s.set_defaults(fn=cmd_import_frames)
+
     s = common(sub.add_parser("prelabel", help="2) draft boxes with an existing model"))
     s.add_argument("--dir", default="farm_data/labeling")
+    s.add_argument("--device", default=None, help="'0' = first GPU, 'cpu'")
+    s.add_argument("--no-previews", action="store_true")
     s.add_argument("--weights", default=None, help="default: MVBroTrack yolo11x_1920.pt if downloaded")
     s.add_argument("--conf", type=float, default=0.25)
     s.add_argument("--imgsz", type=int, default=1920)

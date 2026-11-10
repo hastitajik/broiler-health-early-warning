@@ -72,3 +72,42 @@ def test_build_dataset_needs_labels(tmp_path):
         f.unlink()
     with pytest.raises(ValueError):
         build_dataset(img_dir, lab_dir, tmp_path / "manifest.csv", tmp_path / "ds")
+
+
+def test_import_frames_reads_time_and_renames(tmp_path):
+    from poultry_ews.finetune import import_frames
+    src = tmp_path / "src" / "train"
+    src.mkdir(parents=True)
+    img = np.zeros((72, 128, 3), np.uint8)
+    cv2.imwrite(str(src / "20251116020735157_fps15.mp4_20260425_220611.666.png"), img)
+    cv2.imwrite(str(src / "05.45.00-05.50.00[RO][0@0][0].h264_20260426_222529.516.png"), img)
+    r = import_frames([tmp_path / "src"], tmp_path / "lab", "2025-11-13", use_osd=False)
+    # the mp4 name carries the date; the h264 name only a time of day -> skipped without OSD
+    assert r["imported"] == 1 and len(r["unreadable"]) == 1
+    m = read_manifest(tmp_path / "lab" / "manifest.csv")
+    row = m["cam1_20251116_020735.png"]
+    assert row["age_days"] == "3" and row["phase"] == "starter" and row["ts_source"] == "filename"
+
+
+def test_export_cvat_and_draw(tmp_path):
+    import zipfile
+    from poultry_ews.finetune import draw_labels, export_cvat
+    img_dir, lab_dir = _fake_labelled(tmp_path, days_per_phase=1, per_day=1)
+    n = export_cvat(img_dir, lab_dir, tmp_path / "cvat.zip")
+    z = zipfile.ZipFile(tmp_path / "cvat.zip")
+    names = z.namelist()
+    assert n == 3 and "obj.names" in names and "train.txt" in names
+    assert sum(1 for x in names if x.startswith("obj_train_data/")) == 3
+    first = sorted(img_dir.iterdir())[0]
+    draw_labels(first, lab_dir / (first.stem + ".txt"), tmp_path / "p.jpg", width=64)
+    assert (tmp_path / "p.jpg").exists()
+
+
+def test_osd_reader_on_sample_frame():
+    pytest.importorskip("pytesseract")
+    import shutil as _sh
+    if _sh.which("tesseract") is None:
+        pytest.skip("tesseract not installed")
+    from poultry_ews.osd import read_osd_time
+    p = Path(__file__).resolve().parents[1] / "farm_data" / "samples" / "cam1_2025-12-09_054754.jpg"
+    assert read_osd_time(p) == datetime(2025, 12, 9, 5, 47, 54)

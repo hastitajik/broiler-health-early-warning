@@ -43,6 +43,28 @@ records camera, time, age and phase of each frame.
 Also copy in frames of every bird that was marked "dead" or "alive" in the
 panel. They are the hardest and most useful examples.
 
+### Frames you already exported
+
+If you already have frames (for example in `train`, `val` and `test` folders),
+import them instead of sampling new ones:
+
+```bash
+pews import-frames path/to/train path/to/val path/to/test --placement-date 2025-11-13
+```
+
+The recording date and time are read from the timestamp burned into each frame
+(`osd.py`, needs `tesseract-ocr` and `pytesseract`), because file names like
+`05.45.00-05.50.00[RO][0@0][0].h264_<export date>.png` carry only the time of
+day. Frames are renamed `cam1_YYYYmmdd_HHMMSS.png`. An existing split is
+ignored on purpose: it is redone by day in step 4.
+
+### All of steps 1b and 2 on a free GPU
+
+[`notebooks/prelabel_colab.ipynb`](../notebooks/prelabel_colab.ipynb) does the
+import and the pre-labelling in Google Colab, reading the frames and the
+MVBroTrack model from Google Drive and writing the results back:
+[open in Colab](https://colab.research.google.com/github/hastitajik/broiler-health-early-warning/blob/main/notebooks/prelabel_colab.ipynb).
+
 ## 2. Draft the boxes automatically
 
 ```bash
@@ -50,17 +72,24 @@ pews prelabel --dir farm_data/labeling
 ```
 
 This writes YOLO labels (`labels/<image>.txt`, plus `classes.txt`) predicted by
-the MVBroTrack model. Annotators then only correct the boxes instead of drawing
-150 per frame.
+the MVBroTrack model, a preview JPG per frame with the boxes drawn
+(`previews/`), and `cvat_prelabels_yolo1.1.zip` to import the drafts into CVAT.
+Annotators then only correct the boxes instead of drawing 150 per frame.
 
 Look at a few drafts first. How many boxes are missing or wrong tells you how
 far the MVBroTrack model is from your cameras before any training.
 
 ## 3. Correct the boxes
 
-Use CVAT or Label Studio (free, can run on a local computer). Import the
-images with the YOLO labels, correct them, and export in YOLO format into
-`farm_data/labeling/labels_corrected/`.
+Use CVAT (app.cvat.ai, or installed locally):
+
+1. Create a task with labels `broiler` and `dead`, and upload the files from `images/`.
+2. Actions > Upload annotations > YOLO 1.1 > `cvat_prelabels_yolo1.1.zip`.
+3. Correct the boxes.
+4. Export dataset > YOLO 1.1, and put the `.txt` files into
+   `farm_data/labeling/labels_corrected/`.
+
+Label Studio works as well (YOLO import and export).
 
 Rules:
 - One tight box around the body of every bird whose body is at least half visible.

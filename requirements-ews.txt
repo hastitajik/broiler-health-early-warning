@@ -9,3 +9,5 @@ scipy>=1.10
 # dev:
 # pytest>=8
 # httpx>=0.27
+# reading the timestamp burned into frames (import-frames):
+# pytesseract>=0.3   (+ apt install tesseract-ocr)
