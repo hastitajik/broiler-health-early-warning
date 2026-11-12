@@ -49,7 +49,7 @@ If you already have frames (for example in `train`, `val` and `test` folders),
 import them instead of sampling new ones:
 
 ```bash
-pews import-frames path/to/train path/to/val path/to/test --placement-date 2025-11-13
+pews import-frames path/to/train path/to/val path/to/test --placement-date 2025-11-15
 ```
 
 The recording date and time are read from the timestamp burned into each frame

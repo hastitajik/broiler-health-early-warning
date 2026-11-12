@@ -57,7 +57,7 @@ def test_example_config_loads():
     assert len(cfg.pen("pen1").at(datetime(2025, 11, 20)).drinkers) == 9
     assert len(cfg.pen("pen1").at(datetime(2025, 12, 20)).feeders) == 4
     assert {r.signal for r in cfg.rules} == {"activity", "distribution", "mortality", "circadian"}
-    assert cfg.age_days(datetime(2025, 12, 9)) == 22
+    assert cfg.age_days(datetime(2025, 12, 9)) == 24
     assert 0.025 < cfg.bird_area_m2(22) < 0.03
 
 

@@ -9,7 +9,7 @@ farm:
 
 flock:
   id: "flock-2025-11"
-  placement_date: "2025-11-17"     # day 0 = placement day
+  placement_date: "2025-11-15"     # day 0 = placement day
   initial_count: 150               # PLACEHOLDER: birds placed in all pens
   # Approximate top-view body area of one bird (m^2) by age in days.
   # Used to size blobs for mortality detection. Tune from your own frames.

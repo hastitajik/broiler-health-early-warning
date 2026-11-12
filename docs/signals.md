@@ -148,7 +148,7 @@ Published numbers come from other houses, cameras and flocks. Accuracy on
 this farm is measured against the vet log:
 
 ```bash
-pews validate --pen pen1 --since 2025-11-17 --until 2025-12-31 --out report.md
+pews validate --pen pen1 --since 2025-11-15 --until 2025-12-31 --out report.md
 ```
 
 An alert counts as correct when a vet-recorded problem (clinical sign,

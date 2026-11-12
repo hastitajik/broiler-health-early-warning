@@ -136,7 +136,7 @@ To password-protect the panel, set `PEWS_USER` and `PEWS_PASSWORD`. Expose it on
 ### 6) Measure accuracy
 
 ```bash
-pews validate --pen pen1 --since 2025-11-17 --out report.md
+pews validate --pen pen1 --since 2025-11-15 --out report.md
 ```
 
 Compares every alert with the vet log: recall, precision, false alerts per
